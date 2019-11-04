@@ -1,18 +1,23 @@
 import os
+import time
 
 from django.shortcuts import render, get_object_or_404, reverse
-from django.http import HttpResponse, HttpResponseRedirect, Http404, FileResponse
+from django.http import HttpResponse, HttpResponseRedirect, Http404, FileResponse, JsonResponse
 from django.template import loader
+from django.views.decorators.csrf import csrf_exempt
+from django.utils import timezone
 from django.utils.encoding import smart_str
 
+
 from .models import Device, Deployment
-from .forms import DepthForm
+
 
 def index(request):
     deployment_list =  Deployment.objects.order_by('has_data', 'pk')
     context = {'deployment_list': deployment_list}
     template = loader.get_template('deployment/index.html')
     return HttpResponse(template.render(context, request))
+
 
 def detail(request, deployment_id):
     try:
@@ -37,8 +42,7 @@ def set_depth(request, uid):
         deployment.save()
         return HttpResponseRedirect(reverse('index', args=()))
     elif request.method == "GET":
-        uid = request.GET['eDNA_UID']
-        deployment = get_object_or_404(Deployment, eDNA_UID = uid)
+        deployment = get_object_or_404(Deployment, pk = int(uid))
         if deployment.has_data:
             file_name = "{}.txt".format(deployment.eDNA_UID)
             parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,37 +51,89 @@ def set_depth(request, uid):
             response = FileResponse(f_open, as_attachment=True)
             return response #response
 
+def get_depth(request, uid):
+    if request.method == "GET":
+        deployment = get_object_or_404(Deployment, eDNA_UID = uid)
+        data = {}
+        data['depth'] = deployment.depth
+        data['pump_wait'] = deployment.pump_wait
+        data['flow_volume'] = deployment.flow_volume
+        data['flow_duration'] = deployment.flow_duration
+        response = JsonResponse(data)
+        return response
+
+
 def delete_deployment(request, deployment_id):
     if request.method == "POST":
         deployment = get_object_or_404(Deployment, pk=deployment_id)
         deployment.delete()
         return HttpResponseRedirect(reverse('index', args=()))
 
+def get_datetime(request):
+    if request.method == "GET":
+        datetime_now = int(time.mktime(timezone.now().timetuple())) # Timezone now defaults to UTC
+        data = {"now": datetime_now}
+        print(datetime_now)
+        return JsonResponse(data)
 
-def upload_deployment_data(request, deployment_id):
+@csrf_exempt
+def upload_deployment_data(request, uid):
     if request.method == "POST":
-        deployment = get_object_or_404(Deployment, pk=deployment_id)
+        deployment = get_object_or_404(Deployment, eDNA_UID=uid)
         if (deployment.has_data == False):
-            data = request.FILES['data']
+            n_chunks = int(request.headers["Chunks"])
+            num_bytes = int(request.headers["Data-Bytes"])
+            nth_chunk = int(request.headers["Nth"])
+            # print(request.body[0:num_bytes])
             parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            file_name = "{}.txt".format(deployment.eDNA_UID)
-            new_file = os.path.join(parent_dir, 'eDNA', 'data', file_name)
-            with open(new_file, 'wb+') as dest:
-                for chunk in data.chunks():
-                    dest.write(chunk)
+            if (nth_chunk < n_chunks):
+            # Accumulate data first
+                file_name = "{}_{}.txt".format(deployment.eDNA_UID, nth_chunk)
+                new_file = os.path.join(parent_dir, 'eDNA', 'data', file_name)
+                with open(new_file, 'wb+') as dest:
+                    dest.write(request.body[0:num_bytes])
+            elif (nth_chunk == n_chunks):
+                for i in range(1, n_chunks):
+                    file_name = "{}_{}.txt".format(deployment.eDNA_UID, i)
+                    file_path = os.path.join(parent_dir, 'eDNA', 'data', file_name)
+                    if not os.path.exists(file_path):
+                        print("file not exists")
+                        raise Http404("Missing intermediate files, send again")
+                final_file_name = "{}.txt".format(deployment.eDNA_UID)
+                new_file = os.path.join(parent_dir, 'eDNA', 'data', final_file_name)
+                with open(new_file, 'wb+') as dest:
+                    for i in range(1, n_chunks):
+                        file_name = "{}_{}.txt".format(deployment.eDNA_UID, i)
+                        file_path = os.path.join(parent_dir, 'eDNA', 'data', file_name)
+                        with open(file_path, 'rb') as temp_f:
+                            dest.write(temp_f.read())
+                        os.remove(file_path)
+                    dest.write(request.body[0:num_bytes])
+                print("Done")
+            else:
+                raise Http404("Unexpected nth chunk")
             deployment.has_data = True
+            deployment.save()
+        return HttpResponse(status=200)
+    else:
+        raise Http404("Invalid Post requst to deployment")
 
-        return HttpResponseRedirect(reverse('index', args=()))
 
+@csrf_exempt
 def create_deployment(request, device_id):
     if request.method == "POST":
-        device = Device.objects.get_or_create(
+        device, device_created = Device.objects.get_or_create(
             device_id = device_id
         )
-        eDNA_UID = request.POST['eDNA_UID']
-        Deployment = Deployment.objects.get_or_create(
+        if device_created:
+            device.save()
+        eDNA_UID = request.body[0:8].decode("utf-8") 
+        print(eDNA_UID)
+        deployment, dep_created = Deployment.objects.get_or_create(
             device=device,
-            eDNA_UID = eDNA_UID
+            eDNA_UID=eDNA_UID
         )
-        return HTTPResponse(status=200)
+        if dep_created:
+            deployment.save()
+        return HttpResponse(status=200)
 
